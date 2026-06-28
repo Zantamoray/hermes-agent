@@ -5880,6 +5880,21 @@ def main(
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
     
+    # When no model/base_url supplied on the CLI, read defaults from ~/.hermes/config.yaml
+    # so that `python run_agent.py` respects the same config that `hermes` uses.
+    if not model or not base_url:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_cfg
+            _cfg = _load_cfg()
+            _model_cfg = _cfg.get("model", {})
+            if isinstance(_model_cfg, dict):
+                if not model:
+                    model = (_model_cfg.get("default") or "").strip()
+                if not base_url:
+                    base_url = (_model_cfg.get("base_url") or "").strip()
+        except Exception:
+            pass
+
     # Initialize agent with provided parameters
     try:
         agent = AIAgent(

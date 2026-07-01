@@ -7052,6 +7052,188 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+
+        # ── Zoab CRM Fast Lane ─────────────────────────────────────────────────
+        # Layer 1: exact patterns → direct API call → reply + return (skip LLM).
+        # Layer 2: short natural language → model intent router → reply if routed.
+        # Sanitizer strips any tool/shell traces before sending.
+        # Falls through to LLM only when the CRM API returns "could not determine".
+        try:
+            import re as _re, json as _json, urllib.request as _urlreq
+
+            _TOOL_TRACE_RE = _re.compile(
+                r'git\s+status|ls\s+-l|search_files|read_file'
+                r'|/home/patrick/|\.pyc\b|subprocess|import os'
+                r'|\bterminal\b|\bshell\b',
+                _re.IGNORECASE,
+            )
+            _SAFE_FALLBACK = (
+                "I had trouble producing a clean business answer. "
+                "Try an exact command like: what needs attention"
+            )
+
+            def _crm_sanitize(text):
+                return _SAFE_FALLBACK if _TOOL_TRACE_RE.search(text) else text
+
+            def _crm_api(raw_text, timeout=8):
+                payload = _json.dumps({"text": raw_text}).encode("utf-8")
+                req = _urlreq.Request(
+                    "http://127.0.0.1:5005/api/max/command",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urlreq.urlopen(req, timeout=timeout) as r:
+                    return _json.loads(r.read().decode("utf-8"))
+
+            def _crm_format(data):
+                leads = data.get("leads") or data.get("result", {}).get("leads") or []
+                if leads:
+                    report = data.get("report") or data.get("result", {}).get("report") or "result"
+                    count = data.get("count") or len(leads)
+                    lines = [f"{report.replace('_', ' ').title()}: {count}"]
+                    for x in leads[:10]:
+                        lines.append(f"- {x.get('name', '?')} #{x.get('id', '?')} | {x.get('phone', '')} | {x.get('stage', '')}")
+                    return "\n".join(lines)
+                return str(data.get("message") or "Done.")
+
+            _txt = (event.text or "").strip()
+            _low = _txt.lower()
+
+            if _low.startswith("zoab test"):
+                await msg.reply_text("ZOAB FAST LANE IS ACTIVE")
+                return
+
+            # ── Dry-run / test-mode detection ─────────────────────────────────
+            # If message contains test/fake/dry-run phrases, parse intent but
+            # never write to the production database. Reply with what would happen.
+            _DRY_RUN_RE = _re.compile(
+                r'\b(test|fake|dry[\s\-]?run|pretend|sample|demo)\b',
+                _re.IGNORECASE,
+            )
+
+            def _dry_run_reply(parsed):
+                intent  = parsed.get("intent", "unknown")
+                conf    = parsed.get("confidence", 0.0)
+                name    = parsed.get("client_name")
+                date    = parsed.get("date")
+                amount  = parsed.get("amount")
+                jtype   = parsed.get("job_type")
+                missing = parsed.get("missing_fields") or []
+                err     = parsed.get("_error")
+
+                if err or intent == "unknown" or conf < 0.5:
+                    return (
+                        f"Dry run: could not determine intent "
+                        f"(confidence {conf:.0%}).\n"
+                        "No data changed."
+                    )
+
+                lines = [f"Dry run — {intent.replace('_', ' ')} ({conf:.0%})"]
+                if name:    lines.append(f"Client: {name}")
+                if date:    lines.append(f"Date: {date}")
+                if amount is not None:
+                    lines.append(f"Amount: ${amount:,.0f}")
+                if jtype:   lines.append(f"Job type: {jtype}")
+                if missing: lines.append(f"Missing info: {', '.join(missing)}")
+
+                _name = f'"{name}"' if name else "the client"
+                _date = date or "the date"
+                _amt  = f"${amount:,.0f}" if amount is not None else "the amount"
+                _type = jtype or "the job"
+
+                if intent == "schedule_job":
+                    what = f"Would look up {_name} and schedule job start for {_date}."
+                elif intent == "record_payment":
+                    what = f"Would record a {_amt} payment for {_name}."
+                elif intent == "job_won":
+                    what = f"Would mark {_name} as accepted / won."
+                elif intent == "log_estimate":
+                    what = f"Would log a {_amt} {_type} estimate for {_name}."
+                elif intent == "follow_up":
+                    what = f"Would schedule a follow-up for {_name} on {_date}."
+                elif intent in ("lookup_quote", "show_new_leads", "what_needs_attention"):
+                    what = "Read-only query — would run normally. No data at risk."
+                else:
+                    what = "No action would be taken."
+
+                lines.append(what)
+                lines.append("No production data changed.")
+                return "\n".join(lines)
+
+            if _DRY_RUN_RE.search(_txt):
+                try:
+                    _dr_payload = _json.dumps({"text": _txt}).encode("utf-8")
+                    _dr_req = _urlreq.Request(
+                        "http://127.0.0.1:5005/api/max/dry-run",
+                        data=_dr_payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _urlreq.urlopen(_dr_req, timeout=10) as _dr_r:
+                        _parsed = _json.loads(_dr_r.read().decode("utf-8"))
+                    await msg.reply_text(_dry_run_reply(_parsed))
+                except Exception as _dr_err:
+                    await msg.reply_text(
+                        f"Dry run error: {_dr_err}\nNo data changed."
+                    )
+                return
+            # ── end dry-run detection ──────────────────────────────────────────
+
+            # Layer 1 — exact patterns: always go to CRM, never to LLM
+            _exact_crm = (
+                _re.match(r"^(show|list)\s+new\s+leads", _low) or
+                _re.match(r"^(show|list)\s+lost\s+leads", _low) or
+                _re.match(r"^(show|list)\s+accepted\s+(jobs|leads)", _low) or
+                _re.match(r"^(show|list)\s+open\s+estimates", _low) or
+                _re.match(r"^(show|view|get)\s+lead\s+\d+$", _low) or
+                _re.match(r"^(what is|what's|status of|show)\s+.*lead\s+\d+", _low) or
+                _re.match(r"^what\s+needs\s+attention", _low) or
+                _re.match(r"^what('s)?\s+(due|on\s+my\s+plate|needs\s+follow)", _low) or
+                _re.match(r"^(any\s+)?new\s+leads", _low) or
+                _re.match(r"^lead\s+status\s+\S+", _low) or
+                _re.match(r"^(schedule|book)\s+\S+", _low) or
+                _re.match(r"^\S+\s+starts?\s+(today|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d)", _low) or
+                _re.match(r"^\S+\s+(accepted|approved|signed)", _low) or
+                _re.match(r"^(follow\s+up|followup)\s+\S+", _low) or
+                _re.match(r"^\S+\s+paid\s+", _low) or
+                _re.match(r"^(payment|paid|deposit)\s+", _low) or
+                _re.match(r"^(log|gave|give)\s+(estimate|quote)", _low) or
+                _re.match(r"^what\s+(did\s+I|was)\s+(quote|estimate)", _low) or
+                _re.match(r"^put\s+\S+\s+on\s+the\s+schedule", _low)
+            )
+
+            if _exact_crm:
+                _data = _crm_api(_txt)
+                await msg.reply_text(_crm_sanitize(_crm_format(_data)))
+                return
+
+            # Layer 2 — model router: try API for short natural language
+            # Use result only if the router actually matched a CRM intent.
+            if len(_txt) <= 280 and not _txt.startswith("http") and "\n" not in _txt:
+                try:
+                    _data = _crm_api(_txt)
+                    _action = _data.get("action", "")
+                    _status = _data.get("status", "")
+                    _message = _data.get("message", "")
+                    _unrouted = (
+                        not _action or
+                        (_status == "need_clarification" and
+                         "could not determine" in _message.lower())
+                    )
+                    if not _unrouted:
+                        if _action == "clarification" and _message:
+                            await msg.reply_text(_crm_sanitize(_message))
+                        else:
+                            await msg.reply_text(_crm_sanitize(_crm_format(_data)))
+                        return
+                except Exception:
+                    pass  # API error → fall through to LLM
+
+        except Exception as _e:
+            logger.warning("[Zoab CRM] Fast lane error: %s", _e)
+        # ── end Zoab CRM Fast Lane ─────────────────────────────────────────────
+
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)

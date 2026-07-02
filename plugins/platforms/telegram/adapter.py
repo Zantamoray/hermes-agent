@@ -278,6 +278,11 @@ def _rich_normalize_linebreaks(text: str) -> str:
     return ''.join(out)
 
 
+# Zoab CRM: pending clarification state keyed by Telegram chat_id (str).
+# Populated when Max needs a follow-up answer; TTL = 600 s (10 min).
+_CRM_PENDING: dict = {}
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -7054,13 +7059,16 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
 
         # ── Zoab CRM Fast Lane ─────────────────────────────────────────────────
-        # Layer 1: exact patterns → direct API call → reply + return (skip LLM).
-        # Layer 2: short natural language → model intent router → reply if routed.
+        # Layer 0a: Stateful clarification — complete a pending follow-up.
+        # Layer 0b: Dry-run / test-mode — parse but never write.
+        # Layer 1:  Exact patterns → direct API call → reply + return (skip LLM).
+        # Layer 2:  Short natural language → model intent router → reply if routed.
         # Sanitizer strips any tool/shell traces before sending.
         # Falls through to LLM only when the CRM API returns "could not determine".
         try:
-            import re as _re, json as _json, urllib.request as _urlreq
+            import re as _re, json as _json, urllib.request as _urlreq, time as _time
 
+            # ── helpers ────────────────────────────────────────────────────────
             _TOOL_TRACE_RE = _re.compile(
                 r'git\s+status|ls\s+-l|search_files|read_file'
                 r'|/home/patrick/|\.pyc\b|subprocess|import os'
@@ -7071,6 +7079,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 "I had trouble producing a clean business answer. "
                 "Try an exact command like: what needs attention"
             )
+            _DRY_RUN_RE = _re.compile(
+                r'\b(test|fake|dry[\s\-]?run|pretend|sample|demo)\b',
+                _re.IGNORECASE,
+            )
+            _CANCEL_RE = _re.compile(
+                r'^\s*(cancel|stop|never\s*mind|forget\s+it|skip\s+it|abort)\s*$',
+                _re.IGNORECASE,
+            )
+            _PENDING_TTL = 600  # seconds (10 minutes)
 
             def _crm_sanitize(text):
                 return _SAFE_FALLBACK if _TOOL_TRACE_RE.search(text) else text
@@ -7096,21 +7113,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         lines.append(f"- {x.get('name', '?')} #{x.get('id', '?')} | {x.get('phone', '')} | {x.get('stage', '')}")
                     return "\n".join(lines)
                 return str(data.get("message") or "Done.")
-
-            _txt = (event.text or "").strip()
-            _low = _txt.lower()
-
-            if _low.startswith("zoab test"):
-                await msg.reply_text("ZOAB FAST LANE IS ACTIVE")
-                return
-
-            # ── Dry-run / test-mode detection ─────────────────────────────────
-            # If message contains test/fake/dry-run phrases, parse intent but
-            # never write to the production database. Reply with what would happen.
-            _DRY_RUN_RE = _re.compile(
-                r'\b(test|fake|dry[\s\-]?run|pretend|sample|demo)\b',
-                _re.IGNORECASE,
-            )
 
             def _dry_run_reply(parsed):
                 intent  = parsed.get("intent", "unknown")
@@ -7161,6 +7163,87 @@ class TelegramAdapter(BasePlatformAdapter):
                 lines.append("No production data changed.")
                 return "\n".join(lines)
 
+            def _synthesize_from_pending(pending, reply):
+                """Combine the original pending command with the clarification reply."""
+                return f"{pending['original'].strip()} {reply.strip()}"
+
+            _txt = (event.text or "").strip()
+            _low = _txt.lower()
+            _chat_key = str(getattr(getattr(msg, "chat", None), "id", "0"))
+
+            if _low.startswith("zoab test"):
+                await msg.reply_text("ZOAB FAST LANE IS ACTIVE")
+                return
+
+            # ── Layer 0a: Pending clarification resolution ─────────────────────
+            _pending = _CRM_PENDING.get(_chat_key)
+            if _pending:
+                _age = _time.time() - _pending.get("ts", 0)
+                if _age > _PENDING_TTL:
+                    del _CRM_PENDING[_chat_key]
+                    await msg.reply_text(
+                        "Your pending command expired (10 min limit). Please send it again."
+                    )
+                    # Fall through — process current message as a new command
+                elif _CANCEL_RE.match(_txt):
+                    del _CRM_PENDING[_chat_key]
+                    await msg.reply_text("OK, cancelled.")
+                    return
+                else:
+                    # Detect if the reply looks like a new, unrelated CRM command
+                    _looks_new = bool(
+                        _re.match(r"^(show|list)\s+new\s+leads", _low) or
+                        _re.match(r"^(show|list)\s+lost\s+leads", _low) or
+                        _re.match(r"^(show|list)\s+open\s+estimates", _low) or
+                        _re.match(r"^(show|list)\s+accepted\s+(jobs|leads)", _low) or
+                        _re.match(r"^what\s+needs\s+attention", _low) or
+                        _re.match(r"^(any\s+)?new\s+leads", _low) or
+                        _re.match(r"^lead\s+status\s+\S+", _low) or
+                        _re.match(r"^(show|view|get)\s+lead\s+\d+$", _low)
+                    )
+                    if _looks_new:
+                        _pq = _pending.get("question", "")
+                        await msg.reply_text(
+                            f"You still have a pending command:\n\"{_pq}\"\n"
+                            "Reply with the missing info to complete it, "
+                            "or say 'cancel' to drop it."
+                        )
+                        return
+                    else:
+                        # Treat the reply as the answer to the pending clarification
+                        _is_dry = _pending.get("dry_run", False) or bool(_DRY_RUN_RE.search(_txt))
+                        _synth = _synthesize_from_pending(_pending, _txt)
+                        del _CRM_PENDING[_chat_key]
+                        if _is_dry:
+                            try:
+                                _dr2_payload = _json.dumps({"text": _synth}).encode("utf-8")
+                                _dr2_req = _urlreq.Request(
+                                    "http://127.0.0.1:5005/api/max/dry-run",
+                                    data=_dr2_payload,
+                                    headers={"Content-Type": "application/json"},
+                                    method="POST",
+                                )
+                                with _urlreq.urlopen(_dr2_req, timeout=10) as _dr2_r:
+                                    _parsed_dr2 = _json.loads(_dr2_r.read().decode("utf-8"))
+                                await msg.reply_text(_dry_run_reply(_parsed_dr2))
+                            except Exception as _pe:
+                                await msg.reply_text(f"Dry run error: {_pe}\nNo data changed.")
+                        else:
+                            try:
+                                _res = _crm_api(_synth)
+                                _res_action = _res.get("action", "")
+                                _res_msg = _res.get("message", "")
+                                if _res_action == "clarification" and _res_msg:
+                                    # Still missing a field — ask once more, no further state
+                                    await msg.reply_text(_crm_sanitize(_res_msg))
+                                else:
+                                    await msg.reply_text(_crm_sanitize(_crm_format(_res)))
+                            except Exception as _pe:
+                                await msg.reply_text(f"Error completing command: {_pe}")
+                        return
+            # ── end Layer 0a ───────────────────────────────────────────────────
+
+            # ── Layer 0b: Dry-run / test-mode detection ────────────────────────
             if _DRY_RUN_RE.search(_txt):
                 try:
                     _dr_payload = _json.dumps({"text": _txt}).encode("utf-8")
@@ -7172,15 +7255,27 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     with _urlreq.urlopen(_dr_req, timeout=10) as _dr_r:
                         _parsed = _json.loads(_dr_r.read().decode("utf-8"))
-                    await msg.reply_text(_dry_run_reply(_parsed))
+                    _dr_missing = _parsed.get("missing_fields") or []
+                    _dr_clarify = _parsed.get("clarification")
+                    if _dr_missing and _dr_clarify:
+                        # Missing field detected — ask follow-up and remember dry-run state
+                        _CRM_PENDING[_chat_key] = {
+                            "original": _txt,
+                            "question": _dr_clarify,
+                            "ts": _time.time(),
+                            "dry_run": True,
+                        }
+                        await msg.reply_text(f"[Dry run] {_dr_clarify}")
+                    else:
+                        await msg.reply_text(_dry_run_reply(_parsed))
                 except Exception as _dr_err:
                     await msg.reply_text(
                         f"Dry run error: {_dr_err}\nNo data changed."
                     )
                 return
-            # ── end dry-run detection ──────────────────────────────────────────
+            # ── end Layer 0b ───────────────────────────────────────────────────
 
-            # Layer 1 — exact patterns: always go to CRM, never to LLM
+            # ── Layer 1 — exact patterns ───────────────────────────────────────
             _exact_crm = (
                 _re.match(r"^(show|list)\s+new\s+leads", _low) or
                 _re.match(r"^(show|list)\s+lost\s+leads", _low) or
@@ -7205,11 +7300,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if _exact_crm:
                 _data = _crm_api(_txt)
-                await msg.reply_text(_crm_sanitize(_crm_format(_data)))
+                _l1_action = _data.get("action", "")
+                _l1_msg    = _data.get("message", "")
+                if _l1_action == "clarification" and _l1_msg:
+                    _CRM_PENDING[_chat_key] = {
+                        "original": _txt, "question": _l1_msg,
+                        "ts": _time.time(), "dry_run": False,
+                    }
+                    await msg.reply_text(_crm_sanitize(_l1_msg))
+                else:
+                    await msg.reply_text(_crm_sanitize(_crm_format(_data)))
                 return
 
-            # Layer 2 — model router: try API for short natural language
-            # Use result only if the router actually matched a CRM intent.
+            # ── Layer 2 — model router ─────────────────────────────────────────
             if len(_txt) <= 280 and not _txt.startswith("http") and "\n" not in _txt:
                 try:
                     _data = _crm_api(_txt)
@@ -7223,6 +7326,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     if not _unrouted:
                         if _action == "clarification" and _message:
+                            _CRM_PENDING[_chat_key] = {
+                                "original": _txt, "question": _message,
+                                "ts": _time.time(), "dry_run": False,
+                            }
                             await msg.reply_text(_crm_sanitize(_message))
                         else:
                             await msg.reply_text(_crm_sanitize(_crm_format(_data)))

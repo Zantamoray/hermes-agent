@@ -282,6 +282,58 @@ def _rich_normalize_linebreaks(text: str) -> str:
 # Populated when Max needs a follow-up answer; TTL = 600 s (10 min).
 _CRM_PENDING: dict = {}
 
+_CRM_ID_RE = re.compile(r"^#?\s*(\d+)\s*$")
+_CRM_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_CRM_WS_RE = re.compile(r"\s+")
+
+
+def _crm_normalize_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = _CRM_PUNCT_RE.sub(" ", s)
+    return _CRM_WS_RE.sub(" ", s).strip()
+
+
+def _crm_mashed_name(s: str) -> str:
+    return _crm_normalize_name(s).replace(" ", "")
+
+
+def _resolve_name_candidate(candidates, reply: str):
+    """
+    Resolve a follow-up reply against a name-disambiguation candidate list
+    stored in _CRM_PENDING (mirrors zoab-followup/name_match.resolve_from_candidates —
+    duplicated here since this repo doesn't import from the CRM repo).
+
+    Returns the matched {"id":, "name":} candidate, or None if still ambiguous.
+    """
+    if not candidates:
+        return None
+
+    m = _CRM_ID_RE.match((reply or "").strip())
+    if m:
+        cid = int(m.group(1))
+        hit = [c for c in candidates if c.get("id") == cid]
+        return hit[0] if len(hit) == 1 else None
+
+    r_norm = _crm_normalize_name(reply)
+    r_mashed = _crm_mashed_name(reply)
+    if not r_norm:
+        return None
+
+    full_hits = [
+        c for c in candidates
+        if _crm_normalize_name(c.get("name", "")) == r_norm or _crm_mashed_name(c.get("name", "")) == r_mashed
+    ]
+    if len(full_hits) == 1:
+        return full_hits[0]
+    if len(full_hits) > 1:
+        return None
+
+    part_hits = [c for c in candidates if r_norm in _crm_normalize_name(c.get("name", "")).split()]
+    if len(part_hits) == 1:
+        return part_hits[0]
+
+    return None
+
 
 class TelegramAdapter(BasePlatformAdapter):
     """
@@ -7212,7 +7264,44 @@ class TelegramAdapter(BasePlatformAdapter):
                     else:
                         # Treat the reply as the answer to the pending clarification
                         _is_dry = _pending.get("dry_run", False) or bool(_DRY_RUN_RE.search(_txt))
-                        _synth = _synthesize_from_pending(_pending, _txt)
+                        _YES_RE = _re.compile(
+                            r'^\s*(yes|confirm|record\s+it|proceed|go\s+ahead|yep|yeah|do\s+it)\s*$',
+                            _re.IGNORECASE,
+                        )
+                        # Overpayment confirmation: binary yes/no — don't synthesize
+                        if _pending.get("overpayment_confirm"):
+                            if _YES_RE.match(_txt):
+                                _confirmed_cmd = _pending["original"] + " [overpayment_ok]"
+                                del _CRM_PENDING[_chat_key]
+                                try:
+                                    _res = _crm_api(_confirmed_cmd)
+                                    await msg.reply_text(_crm_sanitize(_crm_format(_res)))
+                                except Exception as _pe:
+                                    await msg.reply_text(f"Error recording payment: {_pe}")
+                            else:
+                                await msg.reply_text(
+                                    "Say 'yes' to record it anyway, or 'cancel' to drop it."
+                                )
+                            return
+                        # Name-disambiguation candidates take priority over generic synthesis:
+                        # resolve the reply (first/last/full/mashed name or #id) against the
+                        # list Max showed last turn, rather than blindly appending it.
+                        if _pending.get("candidates"):
+                            _resolved = _resolve_name_candidate(_pending["candidates"], _txt)
+                            if _resolved is None:
+                                _pending["ts"] = _time.time()
+                                await msg.reply_text(
+                                    "Still not sure which one you mean — reply with the "
+                                    "full name or #ID from the list above."
+                                )
+                                return
+                            _hint = _pending.get("ambiguous_name_hint") or ""
+                            if _hint and _hint in _pending["original"]:
+                                _synth = _pending["original"].replace(_hint, f"#{_resolved['id']}", 1)
+                            else:
+                                _synth = f"{_pending['original'].strip()} #{_resolved['id']}"
+                        else:
+                            _synth = _synthesize_from_pending(_pending, _txt)
                         del _CRM_PENDING[_chat_key]
                         if _is_dry:
                             try:
@@ -7235,6 +7324,14 @@ class TelegramAdapter(BasePlatformAdapter):
                                 _res_msg = _res.get("message", "")
                                 if _res_action == "clarification" and _res_msg:
                                     # Still missing a field — ask once more, no further state
+                                    _store_op = _res.get("overpayment", False)
+                                    _CRM_PENDING[_chat_key] = {
+                                        "original": _synth, "question": _res_msg,
+                                        "ts": _time.time(), "dry_run": False,
+                                        "overpayment_confirm": _store_op,
+                                        "candidates": _res.get("candidates"),
+                                        "ambiguous_name_hint": _res.get("ambiguous_name_hint"),
+                                    }
                                     await msg.reply_text(_crm_sanitize(_res_msg))
                                 else:
                                     await msg.reply_text(_crm_sanitize(_crm_format(_res)))
@@ -7295,17 +7392,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 _re.match(r"^(payment|paid|deposit)\s+", _low) or
                 _re.match(r"^(log|gave|give)\s+(estimate|quote)", _low) or
                 _re.match(r"^what\s+(did\s+I|was)\s+(quote|estimate)", _low) or
-                _re.match(r"^put\s+\S+\s+on\s+the\s+schedule", _low)
+                _re.match(r"^put\s+\S+\s+on\s+the\s+schedule", _low) or
+                _re.match(r"^what\s+does\s+\S+\s+(still\s+)?owe", _low) or
+                _re.match(r"^how\s+much\s+(does\s+)?\S+\s+(still\s+)?owe", _low) or
+                _re.match(r"^how\s+much\s+is\s+(left|remaining)\s+on\s+\S+", _low) or
+                _re.match(r"^(show\s+)?payment\s+status\s+(for\s+)?\S+", _low) or
+                _re.match(r"^\S+('s)?\s+(balance|remaining\s+balance)$", _low) or
+                _re.match(r"^balance\s+(for\s+)?\S+", _low)
             )
 
             if _exact_crm:
                 _data = _crm_api(_txt)
                 _l1_action = _data.get("action", "")
                 _l1_msg    = _data.get("message", "")
+                _l1_ovpay  = _data.get("overpayment", False)
                 if _l1_action == "clarification" and _l1_msg:
                     _CRM_PENDING[_chat_key] = {
                         "original": _txt, "question": _l1_msg,
                         "ts": _time.time(), "dry_run": False,
+                        "overpayment_confirm": bool(_l1_ovpay),
+                        "candidates": _data.get("candidates"),
+                        "ambiguous_name_hint": _data.get("ambiguous_name_hint"),
                     }
                     await msg.reply_text(_crm_sanitize(_l1_msg))
                 else:
@@ -7316,9 +7423,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if len(_txt) <= 280 and not _txt.startswith("http") and "\n" not in _txt:
                 try:
                     _data = _crm_api(_txt)
-                    _action = _data.get("action", "")
-                    _status = _data.get("status", "")
+                    _action  = _data.get("action", "")
+                    _status  = _data.get("status", "")
                     _message = _data.get("message", "")
+                    _ovpay   = _data.get("overpayment", False)
                     _unrouted = (
                         not _action or
                         (_status == "need_clarification" and
@@ -7329,6 +7437,9 @@ class TelegramAdapter(BasePlatformAdapter):
                             _CRM_PENDING[_chat_key] = {
                                 "original": _txt, "question": _message,
                                 "ts": _time.time(), "dry_run": False,
+                                "overpayment_confirm": bool(_ovpay),
+                                "candidates": _data.get("candidates"),
+                                "ambiguous_name_hint": _data.get("ambiguous_name_hint"),
                             }
                             await msg.reply_text(_crm_sanitize(_message))
                         else:

@@ -7283,6 +7283,21 @@ class TelegramAdapter(BasePlatformAdapter):
                                     "Say 'yes' to record it anyway, or 'cancel' to drop it."
                                 )
                             return
+                        # Write-confirmation gate — binary yes/no, re-submits confirm_command
+                        if _pending.get("write_confirm"):
+                            if _YES_RE.match(_txt):
+                                _cc = _pending["confirm_command"]
+                                del _CRM_PENDING[_chat_key]
+                                try:
+                                    _res = _crm_api(_cc)
+                                    await msg.reply_text(_crm_sanitize(_crm_format(_res)))
+                                except Exception as _pe:
+                                    await msg.reply_text(f"Error confirming: {_pe}")
+                            else:
+                                await msg.reply_text(
+                                    "Reply 'yes' to confirm or 'cancel' to drop it."
+                                )
+                            return
                         # Name-disambiguation candidates take priority over generic synthesis:
                         # resolve the reply (first/last/full/mashed name or #id) against the
                         # list Max showed last turn, rather than blindly appending it.
@@ -7323,14 +7338,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                 _res_action = _res.get("action", "")
                                 _res_msg = _res.get("message", "")
                                 if _res_action == "clarification" and _res_msg:
-                                    # Still missing a field — ask once more, no further state
+                                    # Disambiguation resolved but command needs write-confirm
+                                    # or is still missing a field — store and ask once more.
                                     _store_op = _res.get("overpayment", False)
+                                    _synth_wc = _res.get("clarification_type") == "write_confirmation"
                                     _CRM_PENDING[_chat_key] = {
                                         "original": _synth, "question": _res_msg,
                                         "ts": _time.time(), "dry_run": False,
                                         "overpayment_confirm": _store_op,
                                         "candidates": _res.get("candidates"),
                                         "ambiguous_name_hint": _res.get("ambiguous_name_hint"),
+                                        "write_confirm": _synth_wc,
+                                        "confirm_command": _res.get("confirm_command") if _synth_wc else None,
                                     }
                                     await msg.reply_text(_crm_sanitize(_res_msg))
                                 else:
@@ -7407,12 +7426,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 _l1_msg    = _data.get("message", "")
                 _l1_ovpay  = _data.get("overpayment", False)
                 if _l1_action == "clarification" and _l1_msg:
+                    _l1_wc = _data.get("clarification_type") == "write_confirmation"
                     _CRM_PENDING[_chat_key] = {
                         "original": _txt, "question": _l1_msg,
                         "ts": _time.time(), "dry_run": False,
                         "overpayment_confirm": bool(_l1_ovpay),
                         "candidates": _data.get("candidates"),
                         "ambiguous_name_hint": _data.get("ambiguous_name_hint"),
+                        "write_confirm": _l1_wc,
+                        "confirm_command": _data.get("confirm_command") if _l1_wc else None,
                     }
                     await msg.reply_text(_crm_sanitize(_l1_msg))
                 else:
@@ -7434,12 +7456,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     if not _unrouted:
                         if _action == "clarification" and _message:
+                            _l2_wc = _data.get("clarification_type") == "write_confirmation"
                             _CRM_PENDING[_chat_key] = {
                                 "original": _txt, "question": _message,
                                 "ts": _time.time(), "dry_run": False,
                                 "overpayment_confirm": bool(_ovpay),
                                 "candidates": _data.get("candidates"),
                                 "ambiguous_name_hint": _data.get("ambiguous_name_hint"),
+                                "write_confirm": _l2_wc,
+                                "confirm_command": _data.get("confirm_command") if _l2_wc else None,
                             }
                             await msg.reply_text(_crm_sanitize(_message))
                         else:

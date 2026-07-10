@@ -418,6 +418,148 @@ def _rich_normalize_linebreaks(text: str) -> str:
 _UPDATER_STOP_TIMEOUT = 15.0
 
 
+# ── Zoab CRM Fast Lane ───────────────────────────────────────────────────────
+# Bypasses the general agent (and its shell/file/db tools) for common CRM
+# commands, answering directly from the Zoab CRM API instead. This logic
+# previously existed only in the old gateway/platforms/telegram.py, which
+# stopped being loaded once Telegram moved to this plugin (#41112) -- the
+# CRM fast lane was never ported over, so every text message (including
+# plain CRM lookups like "Amanda Novak's job status") went straight to the
+# general agent, which would then improvise with raw shell/db queries
+# instead of the CRM API. Ported and fixed here 2026-07-10.
+_ZOAB_CRM_API_URL = "http://127.0.0.1:5005/api/max/command"
+
+_ZOAB_TOOL_TRACE_RE = re.compile(
+    r'git\s+status|ls\s+-l|search_files|read_file'
+    r'|/home/patrick/|\.pyc\b|subprocess|import os'
+    r'|\bterminal\b|\bshell\b',
+    re.IGNORECASE,
+)
+_ZOAB_SAFE_FALLBACK = (
+    "I had trouble producing a clean business answer. "
+    "Try an exact command like: what needs attention"
+)
+
+
+def _zoab_sanitize(text: str) -> str:
+    return _ZOAB_SAFE_FALLBACK if _ZOAB_TOOL_TRACE_RE.search(text) else text
+
+
+def _zoab_crm_api(raw_text: str, timeout: int = 8) -> dict:
+    import urllib.request
+    payload = json.dumps({"text": raw_text}).encode("utf-8")
+    req = urllib.request.Request(
+        _ZOAB_CRM_API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _zoab_format_crm_response(data: dict) -> str:
+    leads = data.get("leads") or data.get("result", {}).get("leads") or []
+    if leads:
+        report = data.get("report") or data.get("result", {}).get("report") or "result"
+        count = data.get("count") or len(leads)
+        lines = [f"{report.replace('_', ' ').title()}: {count}"]
+        for x in leads[:10]:
+            lines.append(f"- {x.get('name', '?')} #{x.get('id', '?')} | {x.get('phone', '')} | {x.get('stage', '')}")
+        return "\n".join(lines)
+    msg = data.get("message") or ""
+    return str(msg) if msg else "Done."
+
+
+def _zoab_crm_layer1_match(low: str) -> bool:
+    """Zoab CRM Fast Lane Layer 1: exact-pattern match on lowercased text.
+
+    True means the message is routed straight to the Zoab CRM API with a
+    CRM API failure surfaced to Patrick as an explicit error -- never a
+    silent fall-through to the general agent's shell/file tools. Kept as
+    a standalone function so it's directly testable without mocking a
+    Telegram Update.
+    """
+    return bool(
+        re.match(r"^(show|list)\s+new\s+leads", low) or
+        re.match(r"^(show|list)\s+lost\s+leads", low) or
+        re.match(r"^(show|list)\s+accepted\s+(jobs|leads)", low) or
+        re.match(r"^(show|list)\s+open\s+estimates", low) or
+        re.match(r"^(show|view|get)\s+lead\s+\d+$", low) or
+        re.match(r"^(what is|what's|status of|show)\s+.*lead\s+\d+", low) or
+        re.match(r"^what\s+needs\s+attention", low) or
+        re.match(r"^what('s)?\s+(due|on\s+my\s+plate|needs\s+follow)", low) or
+        re.match(r"^(any\s+)?new\s+leads", low) or
+        re.match(r"^lead\s+status\s+\S+", low) or
+        re.match(r"^(schedule|book)\s+\S+", low) or
+        re.match(r"^\S+\s+starts?\s+(today|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d)", low) or
+        re.match(r"^\S+\s+(accepted|approved|signed)", low) or
+        re.match(r"^(follow\s+up|followup)\s+\S+", low) or
+        re.match(r"^\S+\s+paid\s+", low) or
+        re.match(r"^(payment|paid|deposit)\s+", low) or
+        re.match(r"^(log|gave|give)\s+(estimate|quote)", low) or
+        re.match(r"^what\s+(did\s+I|was)\s+(quote|estimate)", low) or
+        re.match(r"^put\s+\S+\s+on\s+the\s+schedule", low) or
+        # "[name] job status" / "[name]'s job status" -- anywhere in the
+        # text, so it matches "Amanda Novak job status" and "what is
+        # Amanda Novak's job status" alike.
+        re.search(r"\bjob\s+status\b", low) or
+        # Single-line "update [name]: [text]" -- adds a CRM note.
+        # Requires the body to start on the same line as the colon (only
+        # space/tab allowed before it), so a genuine multi-line
+        # "update [name]:\n[body]" daily-log entry (a separate CRM
+        # feature) is never captured here.
+        bool(re.match(r"^update\s+(?:for\s+)?[^\n:]+?\s*:[ \t]*\S", low))
+    )
+
+
+async def _zoab_crm_fast_lane_reply(txt: str):
+    """Try the Zoab CRM fast lane for *txt*. Returns the reply string to
+    send if the CRM should handle this message, or None if it should fall
+    through to the general agent unchanged.
+
+    Layer 1 (exact patterns): a CRM API failure propagates as an explicit
+    exception -- the caller replies with a plain error, never silently
+    handing off to the general agent's shell/file tools.
+
+    Layer 2 (short natural language fallback, <=280 chars, single line):
+    POSTs to the CRM's own model-router; used only if it returns a
+    recognized action. A CRM API failure here is logged (previously
+    silent -- the actual root cause of the 2026-07-10 05:05 AM incident,
+    where a swallowed exception left zero trace and the general agent
+    improvised with raw sqlite3 queries instead of the CRM) and falls
+    through to the general agent.
+    """
+    low = txt.lower()
+
+    if low.startswith("zoab test"):
+        return "ZOAB FAST LANE IS ACTIVE"
+
+    if _zoab_crm_layer1_match(low):
+        data = _zoab_crm_api(txt)
+        return _zoab_sanitize(_zoab_format_crm_response(data))
+
+    if len(txt) <= 280 and not txt.startswith("http") and "\n" not in txt:
+        try:
+            data = _zoab_crm_api(txt)
+        except Exception as exc:
+            logger.warning("Zoab CRM Layer 2 fast-lane failed for %r: %s", txt, exc)
+            return None
+        action = data.get("action", "")
+        status = data.get("status", "")
+        message = data.get("message", "")
+        is_unrouted = (
+            not action or
+            (status == "need_clarification" and "could not determine" in message.lower())
+        )
+        if not is_unrouted:
+            if action == "clarification" and message:
+                return _zoab_sanitize(message)
+            return _zoab_sanitize(_zoab_format_crm_response(data))
+
+    return None
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -7327,6 +7469,29 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+
+        # Zoab CRM Fast Lane: answer common CRM commands (leads, job
+        # status, notes, follow-ups, payments, estimates...) directly
+        # from the CRM API, bypassing the general agent so it can't
+        # improvise with shell/file/db tools for a plain CRM lookup.
+        # See _zoab_crm_fast_lane_reply's docstring for the two-layer
+        # design and why Layer 1 failures are surfaced explicitly.
+        txt = (event.text or "").strip()
+        if txt:
+            try:
+                # Layer 1 (exact-pattern) API failures propagate out of
+                # _zoab_crm_fast_lane_reply uncaught, by design, so they're
+                # surfaced here as an explicit error. Layer 2 (natural-
+                # language fallback) already catches and logs its own
+                # failures internally and returns None to fall through.
+                reply = await _zoab_crm_fast_lane_reply(txt)
+            except Exception as exc:
+                await msg.reply_text(f"Zoab CRM error: {exc}")
+                return
+            if reply is not None:
+                await msg.reply_text(reply)
+                return
+
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
